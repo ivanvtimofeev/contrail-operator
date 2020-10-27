@@ -295,7 +295,9 @@ func (r *ReconcileCommand) Reconcile(request reconcile.Request) (reconcile.Resul
 		return reconcile.Result{}, err
 	}
 
-	if err := r.performUpgradeIfNeeded(command, d); err != nil {
+	doUpgrade := true
+	doUpgrade, err = r.performUpgradeIfNeeded(command, d)
+	if err != nil {
 		return reconcile.Result{}, err
 	}
 
@@ -305,21 +307,24 @@ func (r *ReconcileCommand) Reconcile(request reconcile.Request) (reconcile.Resul
 			Name:      command.Name + "-command-deployment",
 		},
 	}
-	if _, err = controllerutil.CreateOrUpdate(context.Background(), r.client, d, func() error {
-		upgrading := true
-		if command.Status.UpgradeState != contrail.CommandUpgrading && command.Status.UpgradeState != contrail.CommandShuttingDownBeforeUpgrade {
-			r.fillDeploymentSpec(command, d)
-			upgrading = false
+
+	if doUpgrade {
+		if _, err = controllerutil.CreateOrUpdate(context.Background(), r.client, d, func() error {
+			upgrading := true
+			if command.Status.UpgradeState != contrail.CommandUpgrading && command.Status.UpgradeState != contrail.CommandShuttingDownBeforeUpgrade {
+				r.fillDeploymentSpec(command, d)
+				upgrading = false
+			}
+			if err := r.prepareIntendedDeployment(d, command); err != nil {
+				return err
+			}
+			if upgrading {
+				d.Spec.Replicas = int32ToPtr(0)
+			}
+			return nil
+		}); err != nil {
+			return reconcile.Result{}, err
 		}
-		if err := r.prepareIntendedDeployment(d, command); err != nil {
-			return err
-		}
-		if upgrading {
-			d.Spec.Replicas = int32ToPtr(0)
-		}
-		return nil
-	}); err != nil {
-		return reconcile.Result{}, err
 	}
 
 	newImage := getImage(command.Spec.ServiceConfiguration.Containers, "api")

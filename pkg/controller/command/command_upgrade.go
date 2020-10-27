@@ -16,23 +16,28 @@ import (
 	"github.com/Juniper/contrail-operator/pkg/job"
 )
 
-func (r *ReconcileCommand) performUpgradeIfNeeded(command *contrail.Command, deployment *apps.Deployment) error {
+func (r *ReconcileCommand) performUpgradeIfNeeded(command *contrail.Command, deployment *apps.Deployment) (bool, error) {
 	command.Status.ContainerImage = getContainerImage(deployment.Spec.Template.Spec.Containers, "api")
 	if isImageChanged(command) && command.Status.UpgradeState != contrail.CommandUpgrading && command.Status.UpgradeState != contrail.CommandStartingUpgradedDeployment {
 		command.Status.UpgradeState = contrail.CommandShuttingDownBeforeUpgrade
 	}
+	doUpgrade := true
 	switch command.Status.UpgradeState {
 	case contrail.CommandShuttingDownBeforeUpgrade:
 		if deployment.Status.Replicas == 0 {
 			command.Status.UpgradeState = contrail.CommandUpgrading
 		}
 	case contrail.CommandUpgrading:
-		completed, err := r.checkDataMigrationCompleted(command)
+		completed, failed, err := r.checkDataMigrationCompleted(command)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if completed {
 			command.Status.UpgradeState = contrail.CommandStartingUpgradedDeployment
+		}
+		if failed {
+			command.Status.UpgradeState = contrail.CommandNotUpgrading
+			doUpgrade = false
 		}
 	case contrail.CommandStartingUpgradedDeployment:
 		upgradedAgain := isImageChanged(command)
@@ -46,7 +51,7 @@ func (r *ReconcileCommand) performUpgradeIfNeeded(command *contrail.Command, dep
 	default: // case contrail.CommandNotUpgrading or UpgradeState is not set
 		command.Status.UpgradeState = contrail.CommandNotUpgrading
 	}
-	return nil
+	return doUpgrade, nil
 }
 
 func (r *ReconcileCommand) deleteMigrationJob(commandCR *contrail.Command) error {
@@ -77,21 +82,24 @@ func isImageChanged(command *contrail.Command) bool {
 	return command.Status.ContainerImage != "" && command.Status.ContainerImage != getImage(command.Spec.ServiceConfiguration.Containers, "api")
 }
 
-func (r *ReconcileCommand) checkDataMigrationCompleted(command *contrail.Command) (bool, error) {
+func (r *ReconcileCommand) checkDataMigrationCompleted(command *contrail.Command) (success bool, failed bool, err error) {
 	dataMigrationJob := &batch.Job{}
 	jobName := types.NamespacedName{Namespace: command.Namespace, Name: command.Name + "-upgrade-job"}
-	err := r.client.Get(context.Background(), jobName, dataMigrationJob)
+	err = r.client.Get(context.Background(), jobName, dataMigrationJob)
 	exists := err == nil
 	if exists {
 		if job.Status(dataMigrationJob.Status).Completed() {
-			return true, nil
+			return true, false, nil
+		}
+		if job.Status(dataMigrationJob.Status).Fail() {
+			return false, true, nil
 		}
 	}
 	if !errors.IsNotFound(err) {
-		return false, err
+		return false, false, err
 	}
 
-	return false, nil
+	return false, false, nil
 }
 
 func (r *ReconcileCommand) reconcileDataMigrationJob(command *contrail.Command, oldImage, newImage, configMapName string) error {
